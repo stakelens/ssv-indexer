@@ -8,6 +8,7 @@ require (
 )
 
 require (
+	github.com/goccy/go-json v0.10.2 // indirect
 	github.com/jackc/puddle/v2 v2.2.1 // indirect
 	go.uber.org/multierr v1.10.0 // indirect
 )

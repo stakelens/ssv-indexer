@@ -2,12 +2,13 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"net/url"
 	"os"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/goccy/go-json"
 
 	"github.com/gorilla/websocket"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -117,6 +118,12 @@ func main() {
 		logger.Fatal("Error reading message from WebSocket", zap.Error(err))
 	}
 
+	var response WebSocketResponse
+	err = json.Unmarshal(message, &response)
+	if err != nil {
+		logger.Fatal("Error parsing JSON", zap.Error(err))
+	}
+
 	// Start real-time data listener in a new goroutine
 	go func() {
 		logger.Info("Listening for real-time data...")
@@ -140,12 +147,7 @@ func main() {
 		}
 	}()
 
-	var response WebSocketResponse
-	err = json.Unmarshal(message, &response)
-	if err != nil {
-		logger.Fatal("Error parsing JSON", zap.Error(err))
-	}
-
+	historicalSyncStart := time.Now()
 	publicKeys := []string{
 		"839d8cb89121aa3cfbd5c6f2cb44611e7689bd8d43c45c19398adcfbe7085404093ba2cb46f32d7b246099fef3ba1835",
 		"b2e5fb301adcf8470b7e72e011aa9e453aea25a6928522257fde9c772f5471626a2a44d165e254ab1eee64a0fa322007",
@@ -253,6 +255,7 @@ func main() {
 	logger.Info("Finished syncing historical data",
 		zap.Int("startIndex", startIndex),
 		zap.Int("endIndex", endIndex),
+		zap.Duration("durationSeconds", time.Since(historicalSyncStart)),
 	)
 
 	// Prevent main from exiting to keep real-time listener running
