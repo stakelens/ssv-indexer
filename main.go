@@ -10,10 +10,83 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
-	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/vistastaking/ssv-indexer/db"
 	"go.uber.org/zap"
 )
+
+const maxConnections = 100
+
+type connectionPool struct {
+	connections       chan *websocket.Conn
+	activeConnections int32
+	logger            *zap.Logger
+}
+
+func newConnectionPool(logger *zap.Logger) *connectionPool {
+	pool := &connectionPool{
+		connections: make(chan *websocket.Conn, maxConnections),
+		logger:      logger,
+	}
+
+	// Prepopulate the pool
+	for i := 0; i < maxConnections; i++ {
+		conn, err := createNewConnection(pool.logger)
+		if err != nil {
+			pool.logger.Error("Failed to create a new connection during prepopulation", zap.Error(err))
+			continue
+		}
+		pool.connections <- conn
+		atomic.AddInt32(&pool.activeConnections, 1)
+	}
+
+	return pool
+}
+
+func (p *connectionPool) getConnection() (*websocket.Conn, error) {
+	select {
+	case conn := <-p.connections:
+		// Reusing an existing connection.
+		return conn, nil
+	default:
+		// Need to create a new connection if we haven't reached the max limit.
+		if atomic.LoadInt32(&p.activeConnections) < maxConnections {
+			conn, err := createNewConnection(p.logger)
+			if err != nil {
+				p.logger.Error("Failed to create a new connection", zap.Error(err))
+				return nil, err
+			}
+			// Successfully created a new connection, so increment the counter.
+			atomic.AddInt32(&p.activeConnections, 1)
+			return conn, nil
+		}
+		// If we've reached the max limit, block until a connection becomes available.
+		conn := <-p.connections
+		return conn, nil
+	}
+}
+
+func (p *connectionPool) releaseConnection(conn *websocket.Conn) {
+	select {
+	case p.connections <- conn:
+		// Successfully returned the connection to the pool.
+	default:
+		// Pool is full; close the connection and decrement the counter.
+		conn.Close()
+		atomic.AddInt32(&p.activeConnections, -1)
+		p.logger.Info("Closed a connection because the pool is full", zap.Int32("activeConnections", atomic.LoadInt32(&p.activeConnections)))
+	}
+}
+
+func createNewConnection(logger *zap.Logger) (*websocket.Conn, error) {
+	queryURL := url.URL{Scheme: "ws", Host: "localhost:16000", Path: "/query"}
+	conn, _, err := websocket.DefaultDialer.Dial(queryURL.String(), nil)
+	if err != nil {
+		logger.Error("Failed to dial a new WebSocket connection", zap.Error(err))
+		return nil, err
+	}
+	return conn, nil
+}
 
 func main() {
 	logger, err := zap.NewProduction()
@@ -22,13 +95,13 @@ func main() {
 	}
 	defer logger.Sync()
 
-	conn, err := pgx.Connect(context.Background(), os.Getenv("DATABASE_URL"))
+	dbConn, err := pgxpool.New(context.Background(), os.Getenv("DATABASE_URL"))
 	if err != nil {
 		logger.Fatal("Unable to connect to database", zap.Error(err))
 	}
-	defer conn.Close(context.Background())
+	defer dbConn.Close()
 
-	queries := db.New(conn)
+	queries := db.New(dbConn)
 
 	streamURL := url.URL{Scheme: "ws", Host: "localhost:16000", Path: "/stream"}
 	logger.Info("Connecting to WebSocket for real-time data", zap.String("url", streamURL.String()))
@@ -43,6 +116,29 @@ func main() {
 	if err != nil {
 		logger.Fatal("Error reading message from WebSocket", zap.Error(err))
 	}
+
+	// Start real-time data listener in a new goroutine
+	go func() {
+		logger.Info("Listening for real-time data...")
+		for {
+			_, message, err := streamConn.ReadMessage()
+			if err != nil {
+				logger.Error("Error reading message from WebSocket", zap.Error(err),
+					zap.String("source", "real-time"))
+				continue
+			}
+
+			var response WebSocketResponse
+			err = json.Unmarshal(message, &response)
+			if err != nil {
+				logger.Error("Error parsing JSON", zap.Error(err),
+					zap.String("source", "real-time"))
+				continue
+			}
+
+			processResponse(response, queries, logger, "real-time")
+		}
+	}()
 
 	var response WebSocketResponse
 	err = json.Unmarshal(message, &response)
@@ -71,128 +167,96 @@ func main() {
 	)
 	time.Sleep(5 * time.Second)
 
-	// Create a channel for sending requests and receiving responses
 	type request struct {
-		payload   []byte
-		responseC chan WebSocketResponse
+		payload []byte
 	}
 
-	requestC := make(chan request)
-
-	// Set up the WebSocket connection for the /query endpoint
-	queryURL := url.URL{Scheme: "ws", Host: "localhost:16000", Path: "/query"}
-	logger.Info("Connecting to WebSocket for historical data", zap.String("url", queryURL.String()))
-
-	queryConn, _, err := websocket.DefaultDialer.Dial(queryURL.String(), nil)
-	if err != nil {
-		logger.Fatal("Error connecting to websocket for historical data", zap.Error(err))
-	}
-	defer queryConn.Close()
-
-	var activeRequests int32
 	totalRequests := int32(len(publicKeys) * (endIndex - startIndex))
+	requestC := make(chan request, totalRequests)
 
-	go func() {
-		for req := range requestC {
-			if err := queryConn.WriteMessage(websocket.TextMessage, req.payload); err != nil {
-				logger.Error("Error sending message through WebSocket", zap.Error(err))
-				close(req.responseC)
-				continue
-			}
+	connPool := newConnectionPool(logger)
 
-			_, message, err := queryConn.ReadMessage()
-			if err != nil {
-				logger.Error("Error reading message from WebSocket", zap.Error(err))
-				close(req.responseC)
-				continue
-			}
-
-			var response WebSocketResponse
-			if err := json.Unmarshal(message, &response); err != nil {
-				logger.Error("Error parsing JSON response", zap.Error(err))
-				close(req.responseC)
-				continue
-			}
-
-			req.responseC <- response
-			close(req.responseC)
-		}
-	}()
-
+	var remainingRequests int32 = totalRequests
 	var wg sync.WaitGroup
-
-	for _, publicKey := range publicKeys {
-		for i := startIndex; i < endIndex; i++ {
-			wg.Add(1)
-			atomic.AddInt32(&activeRequests, 1)
-			go func(publicKey string, i int) {
-				defer wg.Done()
-				defer atomic.AddInt32(&activeRequests, -1)
-
-				payload := map[string]interface{}{
-					"type": "decided",
-					"filter": map[string]interface{}{
-						"publicKey": publicKey,
-						"role":      "ATTESTER",
-						"from":      i,
-						"to":        i,
-					},
-				}
-
-				jsonPayload, err := json.Marshal(payload)
+	for i := 0; i < maxConnections; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for req := range requestC {
+				conn, err := connPool.getConnection()
 				if err != nil {
-					logger.Error("Error marshaling JSON payload", zap.Error(err), zap.String("publicKey", publicKey), zap.Int("index", i))
-					return
+					logger.Error("Failed to get connection from pool", zap.Error(err))
+					continue
 				}
 
-				responseC := make(chan WebSocketResponse)
-				requestC <- request{payload: jsonPayload, responseC: responseC}
+				err = conn.WriteMessage(websocket.TextMessage, req.payload)
+				if err != nil {
+					logger.Error("Failed to write message", zap.Error(err))
+					connPool.releaseConnection(conn)
+					continue
+				}
 
-				response, ok := <-responseC
-				if !ok {
-					logger.Error("Error receiving response from WebSocket", zap.String("publicKey", publicKey), zap.Int("index", i))
-					return
+				_, message, err := conn.ReadMessage()
+				if err != nil {
+					logger.Error("Failed to read message", zap.Error(err))
+					connPool.releaseConnection(conn)
+					continue
+				}
+
+				var response WebSocketResponse
+				if err := json.Unmarshal(message, &response); err != nil {
+					logger.Error("Failed to unmarshal response", zap.Error(err))
+					connPool.releaseConnection(conn)
+					continue
 				}
 
 				processResponse(response, queries, logger, "historical")
 
-				remaining := atomic.LoadInt32(&activeRequests)
+				connPool.releaseConnection(conn)
+
+				atomic.AddInt32(&remainingRequests, -1)
 				logger.Info("Processed request",
-					zap.String("publicKey", publicKey),
-					zap.Int("index", i),
-					zap.Int32("remainingRequests", remaining),
+					zap.Int32("remainingRequests", atomic.LoadInt32(&remainingRequests)),
 					zap.Int32("totalRequests", totalRequests),
 				)
-			}(publicKey, i)
+			}
+		}()
+	}
+
+	// Generate requests
+	for _, publicKey := range publicKeys {
+		for i := startIndex; i < endIndex; i++ {
+			payload, err := json.Marshal(map[string]interface{}{
+				"type": "decided",
+				"filter": map[string]interface{}{
+					"publicKey": publicKey,
+					"role":      "ATTESTER",
+					"from":      i,
+					"to":        i,
+				},
+			})
+
+			if err != nil {
+				logger.Error("Failed to marshal payload", zap.Error(err))
+				continue
+			}
+
+			requestC <- request{
+				payload: payload,
+			}
 		}
 	}
 
-	wg.Wait()
+	close(requestC) // No more requests to send, close the channel
+	wg.Wait()       // Wait for all response processing goroutines to finish
 
-	logger.Info("All historical requests have been processed",
-		zap.Int32("totalRequests", totalRequests),
+	logger.Info("Finished syncing historical data",
+		zap.Int("startIndex", startIndex),
+		zap.Int("endIndex", endIndex),
 	)
 
-	close(requestC)
-
-	for {
-		_, message, err := streamConn.ReadMessage()
-		if err != nil {
-			logger.Error("Error reading message from WebSocket", zap.Error(err),
-				zap.String("source", "real-time"))
-			break
-		}
-
-		var response WebSocketResponse
-		err = json.Unmarshal(message, &response)
-		if err != nil {
-			logger.Error("Error parsing JSON", zap.Error(err),
-				zap.String("source", "real-time"))
-			continue
-		}
-
-		processResponse(response, queries, logger, "real-time")
-	}
+	// Prevent main from exiting to keep real-time listener running
+	select {}
 }
 
 func processResponse(response WebSocketResponse, queries *db.Queries, logger *zap.Logger, source string) {

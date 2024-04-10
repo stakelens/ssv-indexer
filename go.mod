@@ -7,7 +7,10 @@ require (
 	github.com/jackc/pgx/v5 v5.5.5
 )
 
-require go.uber.org/multierr v1.10.0 // indirect
+require (
+	github.com/jackc/puddle/v2 v2.2.1 // indirect
+	go.uber.org/multierr v1.10.0 // indirect
+)
 
 require (
 	github.com/jackc/pgpassfile v1.0.0 // indirect
